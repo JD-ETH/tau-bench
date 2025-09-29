@@ -3,8 +3,13 @@
 import abc
 import enum
 from litellm import completion
-
+import litellm 
 from typing import Optional, List, Dict, Any, Union
+import logging 
+import time
+
+# Set up logger for this module
+logger = logging.getLogger(__name__)
 
 
 class BaseUserSimulationEnv(abc.ABC):
@@ -33,7 +38,8 @@ class HumanUserSimulationEnv(BaseUserSimulationEnv):
     def get_total_cost(self) -> float:
         return 0
 
-
+MAX_RETRIES = 5
+RETRY_DELAY_SECONDS = 0.2
 class LLMUserSimulationEnv(BaseUserSimulationEnv):
     def __init__(self, model: str, provider: str) -> None:
         super().__init__()
@@ -44,9 +50,32 @@ class LLMUserSimulationEnv(BaseUserSimulationEnv):
         self.reset()
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
-        )
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                res = completion(
+                    model=self.model, custom_llm_provider=self.provider, messages=messages
+                )
+                break
+            except litellm.ServiceUnavailableError as e:
+                error_message = f"LLM Service Unavailable: Provider={e.llm_provider}, Model={e.model}. Details: {e}"
+                
+                if attempt == MAX_RETRIES:
+                    logger.error(f"Maximum retries ({MAX_RETRIES}) reached. Raising final error.")
+                    # Raise the serializable error for Ray to forward
+                    raise RuntimeError(error_message) from e 
+                
+                logger.error(
+                    f"LLM call failed (Attempt {attempt}/{MAX_RETRIES}). Error: {e.__class__.__name__}. "
+                    f"Retrying in {RETRY_DELAY_SECONDS} seconds..."
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+
+            except Exception as e:
+                # Catch other unexpected exceptions (e.g., connection errors, model errors)
+                logger.error(f"An unexpected error occurred during LLM call on attempt {attempt}: {e}")
+                # Since Ray can usually serialize standard exceptions, we just re-raise it
+                raise e
+
         message = res.choices[0].message
         self.messages.append(message.model_dump())
         self.total_cost = res._hidden_params["response_cost"]
