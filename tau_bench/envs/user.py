@@ -38,7 +38,7 @@ class HumanUserSimulationEnv(BaseUserSimulationEnv):
     def get_total_cost(self) -> float:
         return 0
 
-MAX_RETRIES = 5
+MAX_RETRIES = 10
 RETRY_DELAY_SECONDS = 1
 class LLMUserSimulationEnv(BaseUserSimulationEnv):
     def __init__(self, model: str, provider: str) -> None:
