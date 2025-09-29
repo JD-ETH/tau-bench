@@ -39,7 +39,7 @@ class HumanUserSimulationEnv(BaseUserSimulationEnv):
         return 0
 
 MAX_RETRIES = 5
-RETRY_DELAY_SECONDS = 0.2
+RETRY_DELAY_SECONDS = 1
 class LLMUserSimulationEnv(BaseUserSimulationEnv):
     def __init__(self, model: str, provider: str) -> None:
         super().__init__()
