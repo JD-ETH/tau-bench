@@ -2,14 +2,9 @@
 
 import abc
 import enum
-from litellm import completion
-import litellm 
 from typing import Optional, List, Dict, Any, Union
-import logging 
-import time
 
-# Set up logger for this module
-logger = logging.getLogger(__name__)
+from tau_bench.chat import ChatFn, litellm_chat
 
 
 class BaseUserSimulationEnv(abc.ABC):
@@ -38,48 +33,24 @@ class HumanUserSimulationEnv(BaseUserSimulationEnv):
     def get_total_cost(self) -> float:
         return 0
 
-MAX_RETRIES = 10
-RETRY_DELAY_SECONDS = 1
 class LLMUserSimulationEnv(BaseUserSimulationEnv):
-    def __init__(self, model: str, provider: str) -> None:
+    """A simulated user driven by a model; the environment opens the conversation through ``reset``."""
+
+    def __init__(
+        self, model: Optional[str] = None, provider: Optional[str] = None, chat: Optional[ChatFn] = None
+    ) -> None:
         super().__init__()
         self.messages: List[Dict[str, Any]] = []
         self.model = model
         self.provider = provider
+        self.chat = chat if chat is not None else litellm_chat(model, provider)
         self.total_cost = 0.0
-        self.reset()
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                res = completion(
-                    model=self.model, custom_llm_provider=self.provider, messages=messages
-                )
-                break
-            except (litellm.ServiceUnavailableError, litellm.InternalServerError) as e:
-                error_message = f"LLM Service Unavailable: Provider={e.llm_provider}, Model={e.model}. Details: {e}"
-                
-                if attempt == MAX_RETRIES:
-                    logger.error(f"Maximum retries ({MAX_RETRIES}) reached. Raising final error.")
-                    # Raise the serializable error for Ray to forward
-                    raise RuntimeError(error_message) from e 
-                
-                logger.error(
-                    f"LLM call failed (Attempt {attempt}/{MAX_RETRIES}). Error: {e.__class__.__name__}. "
-                    f"Retrying in {RETRY_DELAY_SECONDS} seconds..."
-                )
-                time.sleep(RETRY_DELAY_SECONDS)
-
-            except Exception as e:
-                # Catch other unexpected exceptions (e.g., connection errors, model errors)
-                logger.error(f"An unexpected error occurred during LLM call on attempt {attempt}: {e}")
-                # Since Ray can usually serialize standard exceptions, we just re-raise it
-                raise e
-
-        message = res.choices[0].message
-        self.messages.append(message.model_dump())
-        self.total_cost = res._hidden_params["response_cost"]
-        return message.content
+        result = self.chat(messages, None)
+        self.messages.append(result.message)
+        self.total_cost += result.cost
+        return result.message.get("content") or ""
 
     def build_system_prompt(self, instruction: Optional[str]) -> str:
         instruction_display = (
@@ -115,10 +86,6 @@ Rules:
 
 
 class ReactUserSimulationEnv(LLMUserSimulationEnv):
-    def __init__(self, model: str, provider: str) -> None:
-        super().__init__(model=model, provider=provider)
-        self.reset()
-
     def build_system_prompt(self, instruction: Optional[str]) -> str:
         instruction_display = (
             ("\n\nInstruction: " + instruction + "\n")
@@ -144,13 +111,7 @@ User Response:
 <the user response (this will be parsed and sent to the agent)>"""
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
-        )
-        message = res.choices[0].message
-        self.messages.append(message.model_dump())
-        self.total_cost = res._hidden_params["response_cost"]
-        return self.parse_response(message.content)
+        return self.parse_response(super().generate_next_message(messages))
 
     def reset(self, instruction: Optional[str] = None) -> str:
         self.messages = [
@@ -183,27 +144,29 @@ User Response:
 
 
 class VerifyUserSimulationEnv(LLMUserSimulationEnv):
-    def __init__(self, model: str, provider: str, max_attempts: int = 3) -> None:
-        self.model = model
-        self.provider = provider
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        max_attempts: int = 3,
+        chat: Optional[ChatFn] = None,
+    ) -> None:
+        super().__init__(model=model, provider=provider, chat=chat)
         self.max_attempts = max_attempts
-        self.reset()
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         attempts = 0
         cur_message = None
         while attempts < self.max_attempts:
-            res = completion(
-                model=self.model, custom_llm_provider=self.provider, messages=messages
-            )
-            cur_message = res.choices[0].message
-            self.total_cost = res._hidden_params["response_cost"]
-            if verify(self.model, self.provider, cur_message, messages):
-                self.messages.append(cur_message.model_dump())
-                return cur_message.content
+            result = self.chat(messages, None)
+            cur_message = result.message
+            self.total_cost += result.cost
+            if verify(self.chat, cur_message.get("content") or "", messages):
+                self.messages.append(cur_message)
+                return cur_message.get("content") or ""
             attempts += 1
         assert cur_message is not None
-        return cur_message.content
+        return cur_message.get("content") or ""
 
     def reset(self, instruction: Optional[str] = None) -> str:
         self.messages = [
@@ -232,9 +195,7 @@ def map_role_label(role: str) -> str:
         return role.capitalize()
 
 
-def verify(
-    model: str, provider: str, response: str, messages: List[Dict[str, Any]]
-) -> bool:
+def verify(chat: ChatFn, response: str, messages: List[Dict[str, Any]]) -> bool:
     transcript = "\n".join(
         [
             f"{map_role_label(message['role'])}: {message['content']}"
@@ -253,17 +214,11 @@ Your answer will be parsed, so do not include any other text than the classifica
 -----
 
 Classification:"""
-    res = completion(
-        model=model,
-        custom_llm_provider=provider,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return "true" in res.choices[0].message.content.lower()
+    result = chat([{"role": "user", "content": prompt}], None)
+    return "true" in (result.message.get("content") or "").lower()
 
 
-def reflect(
-    model: str, provider: str, response: str, messages: List[Dict[str, Any]]
-) -> str:
+def reflect(chat: ChatFn, response: str, messages: List[Dict[str, Any]]) -> str:
     transcript = "\n".join(
         [
             f"{map_role_label(message['role'])}: {message['content']}"
@@ -287,35 +242,33 @@ Reflection:
 
 Response:
 <the response (this will be parsed and sent to the agent)>"""
-    res = completion(
-        model=model,
-        custom_llm_provider=provider,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    _, response = res.choices[0].message.content.split("Response:")
+    result = chat([{"role": "user", "content": prompt}], None)
+    _, response = (result.message.get("content") or "").split("Response:")
     return response.strip()
 
 
 class ReflectionUserSimulationEnv(LLMUserSimulationEnv):
-    def __init__(self, model: str, provider: str, max_attempts: int = 2) -> None:
-        self.model = model
-        self.provider = provider
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        max_attempts: int = 2,
+        chat: Optional[ChatFn] = None,
+    ) -> None:
+        super().__init__(model=model, provider=provider, chat=chat)
         self.max_attempts = max_attempts
-        self.reset()
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         cur_messages = messages.copy()
         initial_response = super().generate_next_message(cur_messages)
-        if verify(self.model, self.provider, initial_response, cur_messages):
+        if verify(self.chat, initial_response, cur_messages):
             return initial_response
         attempts = 1
         while attempts < self.max_attempts:
-            new_message = reflect(
-                self.model, self.provider, initial_response, cur_messages
-            )
+            new_message = reflect(self.chat, initial_response, cur_messages)
             cur_messages.append({"role": "user", "content": new_message})
             new_response = super().generate_next_message(cur_messages)
-            if verify(self.model, self.provider, new_response, cur_messages):
+            if verify(self.chat, new_response, cur_messages):
                 return new_response
             attempts += 1
         return initial_response
@@ -346,37 +299,27 @@ class UserStrategy(enum.Enum):
     REFLECTION = "reflection"
 
 
+_LLM_USER_CLASSES = {
+    UserStrategy.LLM: LLMUserSimulationEnv,
+    UserStrategy.REACT: ReactUserSimulationEnv,
+    UserStrategy.VERIFY: VerifyUserSimulationEnv,
+    UserStrategy.REFLECTION: ReflectionUserSimulationEnv,
+}
+
+
 def load_user(
     user_strategy: Union[str, UserStrategy],
     model: Optional[str] = "gpt-4o",
     provider: Optional[str] = None,
+    chat: Optional[ChatFn] = None,
 ) -> BaseUserSimulationEnv:
+    """The simulator of a strategy; an LLM strategy needs ``chat``, or a ``model`` and ``provider`` for litellm."""
     if isinstance(user_strategy, str):
         user_strategy = UserStrategy(user_strategy)
     if user_strategy == UserStrategy.HUMAN:
         return HumanUserSimulationEnv()
-    elif user_strategy == UserStrategy.LLM:
-        if model is None:
-            raise ValueError("LLM user strategy requires a model")
-        if provider is None:
-            raise ValueError("LLM user strategy requires a model provider")
-        return LLMUserSimulationEnv(model=model, provider=provider)
-    elif user_strategy == UserStrategy.REACT:
-        if model is None:
-            raise ValueError("React user strategy requires a model")
-        if provider is None:
-            raise ValueError("React user strategy requires a model provider")
-        return ReactUserSimulationEnv(model=model, provider=provider)
-    elif user_strategy == UserStrategy.VERIFY:
-        if model is None:
-            raise ValueError("Verify user strategy requires a model")
-        if provider is None:
-            raise ValueError("Verify user strategy requires a model provider")
-        return VerifyUserSimulationEnv(model=model, provider=provider)
-    elif user_strategy == UserStrategy.REFLECTION:
-        if model is None:
-            raise ValueError("Reflection user strategy requires a model")
-        if provider is None:
-            raise ValueError("Reflection user strategy requires a model provider")
-        return ReflectionUserSimulationEnv(model=model, provider=provider)
-    raise ValueError(f"Unknown user strategy {user_strategy}")
+    if user_strategy not in _LLM_USER_CLASSES:
+        raise ValueError(f"Unknown user strategy {user_strategy}")
+    if chat is None and (model is None or provider is None):
+        raise ValueError(f"{user_strategy.value} user strategy requires a model and a model provider, or a chat function")
+    return _LLM_USER_CLASSES[user_strategy](model=model, provider=provider, chat=chat)

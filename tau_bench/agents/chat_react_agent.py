@@ -1,9 +1,9 @@
 # Copyright Sierra
 
 import json
-from litellm import completion
 
 from tau_bench.agents.base import Agent
+from tau_bench.chat import ChatFn, litellm_chat
 from tau_bench.envs.base import Env
 from tau_bench.types import (
     Action,
@@ -23,6 +23,7 @@ class ChatReActAgent(Agent):
         provider: str,
         use_reasoning: bool = True,
         temperature: float = 0.0,
+        chat: Optional[ChatFn] = None,
     ) -> None:
         instruction = REACT_INSTRUCTION if use_reasoning else ACT_INSTRUCTION
         self.prompt = (
@@ -33,18 +34,14 @@ class ChatReActAgent(Agent):
         self.temperature = temperature
         self.use_reasoning = use_reasoning
         self.tools_info = tools_info
+        self.chat = chat if chat is not None else litellm_chat(model, provider, temperature=temperature)
 
     def generate_next_step(
         self, messages: List[Dict[str, Any]]
     ) -> Tuple[Dict[str, Any], Action, float]:
-        res = completion(
-            model=self.model,
-            custom_llm_provider=self.provider,
-            messages=messages,
-            temperature=self.temperature,
-        )
-        message = res.choices[0].message
-        action_str = message.content.split("Action:")[-1].strip()
+        result = self.chat(messages, None)
+        message = result.message
+        action_str = (message.get("content") or "").split("Action:")[-1].strip()
         try:
             action_parsed = json.loads(action_str)
         except json.JSONDecodeError:
@@ -56,7 +53,7 @@ class ChatReActAgent(Agent):
         assert "name" in action_parsed
         assert "arguments" in action_parsed
         action = Action(name=action_parsed["name"], kwargs=action_parsed["arguments"])
-        return message.model_dump(), action, res._hidden_params["response_cost"]
+        return message, action, result.cost
 
     def solve(
         self, env: Env, task_index: Optional[int] = None, max_num_steps: int = 30
