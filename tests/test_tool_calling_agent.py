@@ -101,3 +101,11 @@ def test_tool_call_to_action_accepts_dict_arguments_and_rejects_non_objects():
         assert "JSON object" in str(e)
     else:
         raise AssertionError("a JSON list must be rejected")
+
+
+def test_a_turn_with_neither_tool_call_nor_reply_ends_the_episode():
+    silent = {"role": "assistant", "content": "\n\n", "reasoning_content": "..."}
+    result, chat, env = solve([ChatResult(message=silent, finish_reason="stop")])
+    assert env.actions == []
+    assert len(chat.requests) == 1
+    assert result.messages[-1] == silent

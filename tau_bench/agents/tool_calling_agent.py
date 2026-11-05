@@ -43,15 +43,15 @@ class ToolCallingAgent(Agent):
             total_cost += result.cost
             # The turn is kept as the model produced it, so that replaying it extends the same tokens.
             messages.append(result.message)
-            if result.finish_reason == "length":
-                # Cut off before the model finished deciding: nothing to act on, and the turn cannot be resumed.
+            tool_calls = result.message.get("tool_calls") or []
+            content = (result.message.get("content") or "").strip()
+            if result.finish_reason == "length" or not (tool_calls or content):
+                # Cut off before deciding, or neither a tool call nor a reply: nothing to act on, and an empty
+                # user-facing message would be rejected downstream. The episode ends with the reward so far.
                 break
             done = False
-            tool_calls = result.message.get("tool_calls") or []
             if not tool_calls:
-                env_response = env.step(
-                    Action(name=RESPOND_ACTION_NAME, kwargs={RESPOND_ACTION_FIELD_NAME: result.message.get("content") or ""})
-                )
+                env_response = env.step(Action(name=RESPOND_ACTION_NAME, kwargs={RESPOND_ACTION_FIELD_NAME: content}))
                 reward, info, done = env_response.reward, {**info, **env_response.info.model_dump()}, env_response.done
                 messages.append({"role": "user", "content": env_response.observation})
             # Every call of the turn runs, in order, each answered by its own tool message.
