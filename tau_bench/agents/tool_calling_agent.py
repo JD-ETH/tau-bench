@@ -1,12 +1,12 @@
 # Copyright Sierra
 
 import json
-from litellm import completion
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
 from tau_bench.agents.base import Agent
+from tau_bench.chat import ChatFn, litellm_chat
 from tau_bench.envs.base import Env
-from tau_bench.types import SolveResult, Action, RESPOND_ACTION_NAME
+from tau_bench.types import RESPOND_ACTION_FIELD_NAME, RESPOND_ACTION_NAME, Action, SolveResult
 
 
 class ToolCallingAgent(Agent):
@@ -14,80 +14,80 @@ class ToolCallingAgent(Agent):
         self,
         tools_info: List[Dict[str, Any]],
         wiki: str,
-        model: str,
-        provider: str,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
         temperature: float = 0.0,
+        chat: Optional[ChatFn] = None,
     ):
         self.tools_info = tools_info
         self.wiki = wiki
         self.model = model
         self.provider = provider
         self.temperature = temperature
+        self.chat = chat if chat is not None else litellm_chat(model, provider, temperature=temperature)
 
-    def solve(
-        self, env: Env, task_index: Optional[int] = None, max_num_steps: int = 30
-    ) -> SolveResult:
+    def system_prompt(self) -> str:
+        return self.wiki
+
+    def solve(self, env: Env, task_index: Optional[int] = None, max_num_steps: int = 30) -> SolveResult:
         total_cost = 0.0
         env_reset_res = env.reset(task_index=task_index)
-        obs = env_reset_res.observation
         info = env_reset_res.info.model_dump()
         reward = 0.0
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.wiki},
-            {"role": "user", "content": obs},
+            {"role": "system", "content": self.system_prompt()},
+            {"role": "user", "content": env_reset_res.observation},
         ]
         for _ in range(max_num_steps):
-            res = completion(
-                messages=messages,
-                model=self.model,
-                custom_llm_provider=self.provider,
-                tools=self.tools_info,
-                temperature=self.temperature,
-            )
-            next_message = res.choices[0].message.model_dump()
-            total_cost += res._hidden_params["response_cost"] or 0
-            action = message_to_action(next_message)
-            env_response = env.step(action)
-            reward = env_response.reward
-            info = {**info, **env_response.info.model_dump()}
-            if action.name != RESPOND_ACTION_NAME:
-                next_message["tool_calls"] = next_message["tool_calls"][:1]
-                messages.extend(
-                    [
-                        next_message,
-                        {
-                            "role": "tool",
-                            "tool_call_id": next_message["tool_calls"][0]["id"],
-                            "name": next_message["tool_calls"][0]["function"]["name"],
-                            "content": env_response.observation,
-                        },
-                    ]
-                )
-            else:
-                messages.extend(
-                    [
-                        next_message,
-                        {"role": "user", "content": env_response.observation},
-                    ]
-                )
-            if env_response.done:
+            result = self.chat(messages, self.tools_info)
+            total_cost += result.cost
+            # The turn is kept as the model produced it, so that replaying it extends the same tokens.
+            messages.append(result.message)
+            tool_calls = result.message.get("tool_calls") or []
+            content = (result.message.get("content") or "").strip()
+            if result.finish_reason == "length" or not (tool_calls or content):
+                # Cut off before deciding, or neither a tool call nor a reply: nothing to act on, and an empty
+                # user-facing message would be rejected downstream. The episode ends with the reward so far.
                 break
-        return SolveResult(
-            reward=reward,
-            info=info,
-            messages=messages,
-            total_cost=total_cost,
-        )
+            done = False
+            if not tool_calls:
+                env_response = env.step(Action(name=RESPOND_ACTION_NAME, kwargs={RESPOND_ACTION_FIELD_NAME: content}))
+                reward, info, done = env_response.reward, {**info, **env_response.info.model_dump()}, env_response.done
+                messages.append({"role": "user", "content": env_response.observation})
+            # Every call of the turn runs, in order, each answered by its own tool message.
+            for tool_call in tool_calls:
+                if done:
+                    observation = "Error: the conversation has ended"
+                else:
+                    try:
+                        action = tool_call_to_action(tool_call)
+                    except ValueError as e:
+                        observation = f"Error: {e}"
+                    else:
+                        env_response = env.step(action)
+                        reward, info, done = env_response.reward, {**info, **env_response.info.model_dump()}, env_response.done
+                        observation = env_response.observation
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_call["function"]["name"],
+                        "content": observation,
+                    }
+                )
+            if done:
+                break
+        return SolveResult(reward=reward, info=info, messages=messages, total_cost=total_cost)
 
 
-def message_to_action(
-    message: Dict[str, Any],
-) -> Action:
-    if "tool_calls" in message and message["tool_calls"] is not None and len(message["tool_calls"]) > 0 and message["tool_calls"][0]["function"] is not None:
-        tool_call = message["tool_calls"][0]
-        return Action(
-            name=tool_call["function"]["name"],
-            kwargs=json.loads(tool_call["function"]["arguments"]),
-        )
-    else:
-        return Action(name=RESPOND_ACTION_NAME, kwargs={"content": message["content"]})
+def tool_call_to_action(tool_call: Dict[str, Any]) -> Action:
+    """The environment action of one OpenAI tool call; ``ValueError`` when its arguments are not valid JSON."""
+    arguments = tool_call["function"]["arguments"]
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"tool call arguments are not valid JSON ({e}): {arguments}") from e
+    if not isinstance(arguments, dict):
+        raise ValueError(f"tool call arguments must be a JSON object, got {type(arguments).__name__}")
+    return Action(name=tool_call["function"]["name"], kwargs=arguments)

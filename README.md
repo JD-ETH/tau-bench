@@ -174,3 +174,27 @@ Please submit issues or pull requests if you find problems with the benchmark.
       url={https://arxiv.org/abs/2506.07982}, 
 }
 ```
+
+## Bringing your own model endpoint
+
+Every agent and every LLM user simulator calls the model through one injectable function,
+`tau_bench.chat.ChatFn`: `chat(messages, tools) -> ChatResult`, where `ChatResult.message` is the
+assistant message exactly as the model returned it (content, `tool_calls`, `reasoning_content`),
+plus `finish_reason` and `cost`. The default, `litellm_chat(model, provider, temperature)`, is what
+`run.py` uses. Pass your own to reach another endpoint or to control sampling and request options:
+
+```python
+from tau_bench.agents.tool_calling_agent import ToolCallingAgent
+from tau_bench.envs import get_env
+from tau_bench.envs.user import LLMUserSimulationEnv
+
+env = get_env("retail", user_strategy="llm", user_model=None, task_split="test", task_index=0,
+              user=LLMUserSimulationEnv(chat=my_user_chat))
+agent = ToolCallingAgent(tools_info=env.tools_info, wiki=env.wiki, chat=my_policy_chat)
+result = agent.solve(env, task_index=0)
+```
+
+The tool-calling agent executes every tool call of a turn, in order, and appends one `tool`
+message per call; a turn that ends with `finish_reason == "length"` ends the episode. Replaying
+`result.messages` to the same endpoint reproduces the conversation token for token, which is what
+token-in-token-out RL training needs.
